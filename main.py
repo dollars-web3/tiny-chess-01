@@ -1,413 +1,2 @@
-# tiny-chess-01 entry: a compact chess engine (negamax + alpha-beta, quiescence,
-# transposition table, tapered PST eval) with a driver for the make.fun env.
-# Deterministic: the search stops on a fixed node budget, never on a clock.
-import os, sys, json, random
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
-
-# ---------- board: 0x88, pieces +1..+6 = P N B R Q K (white), negative = black
-KN = (33, 31, 18, 14, -14, -18, -31, -33)
-KG = (16, -16, 1, -1, 17, 15, -15, -17)
-BD = (17, 15, -15, -17)
-RD = (16, -16, 1, -1)
-VAL = (0, 100, 320, 330, 500, 900, 0)
-VALE = (0, 120, 320, 330, 500, 900, 0)
-PST = {
-1: (0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10, 5,5,10,25,25,10,5,5, 0,0,0,20,20,0,0,0, 5,-5,-10,0,0,-10,-5,5, 5,10,10,-20,-20,10,10,5, 0,0,0,0,0,0,0,0),
-2: (-50,-40,-30,-30,-30,-30,-40,-50, -40,-20,0,0,0,0,-20,-40, -30,0,10,15,15,10,0,-30, -30,5,15,20,20,15,5,-30, -30,0,15,20,20,15,0,-30, -30,5,10,15,15,10,5,-30, -40,-20,0,5,5,0,-20,-40, -50,-40,-30,-30,-30,-30,-40,-50),
-3: (-20,-10,-10,-10,-10,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,10,10,5,0,-10, -10,5,5,10,10,5,5,-10, -10,0,10,10,10,10,0,-10, -10,10,10,10,10,10,10,-10, -10,5,0,0,0,0,5,-10, -20,-10,-10,-10,-10,-10,-10,-20),
-4: (0,0,0,0,0,0,0,0, 5,10,10,10,10,10,10,5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, 0,0,0,5,5,0,0,0),
-5: (-20,-10,-10,-5,-5,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,5,5,5,0,-10, -5,0,5,5,5,5,0,-5, 0,0,5,5,5,5,0,-5, -10,5,5,5,5,5,0,-10, -10,0,5,0,0,0,0,-10, -20,-10,-10,-5,-5,-10,-10,-20),
-6: (-30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10, 20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20),
-}
-PSTE = {
-1: (0,0,0,0,0,0,0,0, 35,35,35,35,35,35,35,35, 25,25,25,25,25,25,25,25, 15,15,15,15,15,15,15,15, 8,8,8,8,8,8,8,8, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0),
-6: (-50,-40,-30,-20,-20,-30,-40,-50, -30,-20,-10,0,0,-10,-20,-30, -30,-10,20,30,30,20,-10,-30, -30,-10,30,40,40,30,-10,-30, -30,-10,30,40,40,30,-10,-30, -30,-10,20,30,30,20,-10,-30, -30,-30,0,0,0,0,-30,-30, -50,-30,-30,-30,-30,-30,-30,-50),
-}
-_r = random.Random(20261117)
-ZK = [[_r.getrandbits(64) for _ in range(128)] for _ in range(13)]
-ZC = [_r.getrandbits(64) for _ in range(16)]
-ZE = [_r.getrandbits(64) for _ in range(8)]
-ZS = _r.getrandbits(64)
-MATE = 100000
-CAP = 30000
-
-class Pos:
-    __slots__ = ('b', 'side', 'cast', 'ep', 'half', 'h', 'k', 'pl')
-    def __init__(self):
-        self.b = [0] * 128
-        self.side = 1; self.cast = 0; self.ep = -1; self.half = 0; self.h = 0
-        self.k = [-1, -1]; self.pl = []
-
-def parse_fen(fen):
-    p = Pos()
-    parts = fen.split()
-    rows = parts[0].split('/')
-    mp = {'p': 1, 'n': 2, 'b': 3, 'r': 4, 'q': 5, 'k': 6}
-    for i, row in enumerate(rows):
-        rank = 7 - i; f = 0
-        for ch in row:
-            if ch.isdigit(): f += int(ch)
-            else:
-                v = mp[ch.lower()]
-                p.b[rank * 16 + f] = v if ch.isupper() else -v
-                p.pl.append(rank * 16 + f)
-                if v == 6: p.k[0 if ch.isupper() else 1] = rank * 16 + f
-                f += 1
-    p.side = 1 if len(parts) < 2 or parts[1] == 'w' else -1
-    cast = parts[2] if len(parts) > 2 else '-'
-    p.cast = (('K' in cast) * 1) | (('Q' in cast) * 2) | (('k' in cast) * 4) | (('q' in cast) * 8)
-    if len(parts) > 3 and parts[3] != '-':
-        p.ep = (int(parts[3][1]) - 1) * 16 + (ord(parts[3][0]) - 97)
-    if len(parts) > 4: p.half = int(parts[4])
-    h = 0
-    for s in range(128):
-        v = p.b[s]
-        if v: h ^= ZK[v + 6][s]
-    h ^= ZC[p.cast]
-    if p.ep >= 0: h ^= ZE[p.ep & 7]
-    if p.side < 0: h ^= ZS
-    p.h = h
-    return p
-
-def attacked(p, sq, by):
-    b = p.b
-    if by > 0:
-        for d in (-15, -17):
-            t = sq + d
-            if not (t & 0x88) and b[t] == 1: return True
-    else:
-        for d in (15, 17):
-            t = sq + d
-            if not (t & 0x88) and b[t] == -1: return True
-    for d in KN:
-        t = sq + d
-        if not (t & 0x88) and b[t] == 2 * by: return True
-    for d in KG:
-        t = sq + d
-        if not (t & 0x88) and b[t] == 6 * by: return True
-    for dirs, kinds in ((BD, (3, 5)), (RD, (4, 5))):
-        for d in dirs:
-            t = sq + d
-            while not (t & 0x88):
-                v = b[t]
-                if v:
-                    if v == kinds[0] * by or v == kinds[1] * by: return True
-                    break
-                t += d
-    return False
-
-def gen_moves(p, caps_only=False):
-    b = p.b; side = p.side; moves = []
-    for s in p.pl:
-        v = b[s]
-        if (v > 0) != (side > 0): continue
-        a = abs(v); r = s >> 4
-        if a == 1:
-            fwd = 16 * side
-            promo_rank = 6 if side > 0 else 1
-            for d in (fwd - 1, fwd + 1):
-                t = s + d
-                if t & 0x88: continue
-                if b[t] and (b[t] > 0) != (side > 0) or t == p.ep:
-                    if r == promo_rank:
-                        for pr in (5, 2): moves.append((s, t, pr * side))
-                    else: moves.append((s, t, 0))
-            t = s + fwd
-            if not (t & 0x88) and not b[t]:
-                if not caps_only:
-                    if r == promo_rank:
-                        for pr in (5, 2, 4, 3): moves.append((s, t, pr * side))
-                    else: moves.append((s, t, 0))
-                    start = 1 if side > 0 else 6
-                    t2 = s + 2 * fwd
-                    if r == start and not b[t2]: moves.append((s, t2, 0))
-                elif r == promo_rank:
-                    for pr in (5, 2): moves.append((s, t, pr * side))
-        elif a == 2:
-            for d in KN:
-                t = s + d
-                if t & 0x88: continue
-                if not b[t] or (b[t] > 0) != (side > 0):
-                    if not caps_only or b[t]: moves.append((s, t, 0))
-        elif a == 6:
-            for d in KG:
-                t = s + d
-                if t & 0x88: continue
-                if not b[t] or (b[t] > 0) != (side > 0):
-                    if not caps_only or b[t]: moves.append((s, t, 0))
-            if not caps_only:
-                if side > 0 and s == 4:
-                    if p.cast & 1 and not b[5] and not b[6] and b[7] == 4 and not attacked(p, 4, -1) and not attacked(p, 5, -1) and not attacked(p, 6, -1): moves.append((4, 6, 0))
-                    if p.cast & 2 and not b[3] and not b[2] and not b[1] and b[0] == 4 and not attacked(p, 4, -1) and not attacked(p, 3, -1) and not attacked(p, 2, -1): moves.append((4, 2, 0))
-                if side < 0 and s == 116:
-                    if p.cast & 4 and not b[117] and not b[118] and b[119] == -4 and not attacked(p, 116, 1) and not attacked(p, 117, 1) and not attacked(p, 118, 1): moves.append((116, 118, 0))
-                    if p.cast & 8 and not b[115] and not b[114] and not b[113] and b[112] == -4 and not attacked(p, 116, 1) and not attacked(p, 115, 1) and not attacked(p, 114, 1): moves.append((116, 114, 0))
-        else:
-            dirs = BD if a == 3 else RD if a == 4 else KG
-            for d in dirs:
-                t = s + d
-                while not (t & 0x88):
-                    if not b[t]:
-                        if not caps_only: moves.append((s, t, 0))
-                    else:
-                        if (b[t] > 0) != (side > 0): moves.append((s, t, 0))
-                        break
-                    t += d
-    return moves
-
-def make(p, m):
-    s, t, pr = m
-    b = p.b
-    v = b[s]; cap = b[t]; undo = [cap, p.cast, p.ep, p.half, None, p.h, p.k[0], p.k[1]]
-    if abs(v) == 6: p.k[0 if p.side > 0 else 1] = t
-    h = p.h ^ ZC[p.cast]
-    if p.ep >= 0: h ^= ZE[p.ep & 7]
-    p.ep = -1
-    if cap: h ^= ZK[cap + 6][t]; p.pl.remove(t)
-    b[t] = v; b[s] = 0
-    p.pl[p.pl.index(s)] = t
-    h ^= ZK[v + 6][s] ^ ZK[v + 6][t]
-    if abs(v) == 1:
-        p.half = 0
-        if t == undo[2] and cap == 0 and (t & 7) != (s & 7):
-            cs = t - 16 * p.side
-            undo[4] = b[cs]; h ^= ZK[b[cs] + 6][cs]; b[cs] = 0; p.pl.remove(cs)
-        elif abs(t - s) == 32:
-            p.ep = (s + t) // 2; h ^= ZE[p.ep & 7]
-        if pr:
-            b[t] = pr; h ^= ZK[v + 6][t] ^ ZK[pr + 6][t]
-    elif cap: p.half = 0
-    else: p.half += 1
-    if abs(v) == 6:
-        if p.side > 0: p.cast &= ~3
-        else: p.cast &= ~12
-        if abs(t - s) == 2:
-            if t == 6: b[5] = b[7]; b[7] = 0; h ^= ZK[4 + 6][7] ^ ZK[4 + 6][5]; p.pl[p.pl.index(7)] = 5
-            elif t == 2: b[3] = b[0]; b[0] = 0; h ^= ZK[4 + 6][0] ^ ZK[4 + 6][3]; p.pl[p.pl.index(0)] = 3
-            elif t == 118: b[117] = b[119]; b[119] = 0; h ^= ZK[-4 + 6][119] ^ ZK[-4 + 6][117]; p.pl[p.pl.index(119)] = 117
-            elif t == 114: b[115] = b[112]; b[112] = 0; h ^= ZK[-4 + 6][112] ^ ZK[-4 + 6][115]; p.pl[p.pl.index(112)] = 115
-    if t == 7 or s == 7: p.cast &= ~1
-    if t == 0 or s == 0: p.cast &= ~2
-    if t == 119 or s == 119: p.cast &= ~4
-    if t == 112 or s == 112: p.cast &= ~8
-    p.cast &= 15
-    h ^= ZC[p.cast] ^ ZS
-    p.h = h
-    p.side = -p.side
-    return undo
-
-def unmake(p, m, undo):
-    s, t, pr = m
-    p.side = -p.side
-    b = p.b
-    v = b[t]
-    if pr: v = 1 * p.side
-    b[s] = v; b[t] = undo[0]
-    p.pl[p.pl.index(t)] = s
-    if undo[0]: p.pl.append(t)
-    if undo[4] is not None:
-        cs = t - 16 * p.side
-        b[cs] = undo[4]; p.pl.append(cs)
-    if abs(v) == 6 and abs(t - s) == 2:
-        if t == 6: b[7] = b[5]; b[5] = 0; p.pl[p.pl.index(5)] = 7
-        elif t == 2: b[0] = b[3]; b[3] = 0; p.pl[p.pl.index(3)] = 0
-        elif t == 118: b[119] = b[117]; b[117] = 0; p.pl[p.pl.index(117)] = 119
-        elif t == 114: b[112] = b[115]; b[115] = 0; p.pl[p.pl.index(115)] = 112
-    p.cast, p.ep, p.half = undo[1], undo[2], undo[3]
-    p.h = undo[5]
-    p.k[0], p.k[1] = undo[6], undo[7]
-
-def evaluate(p):
-    b = p.b; mg = 0; eg = 0; phase = 0; bishops = [0, 0]
-    for s in p.pl:
-        v = b[s]
-        a = abs(v); f = s & 7; r = s >> 4
-        if v > 0: ti = (7 - r) * 8 + f
-        else: ti = r * 8 + f
-        m = VAL[a] + PST[a][ti]
-        e = VALE[a] + PSTE.get(a, PST[a])[ti]
-        if v > 0: mg += m; eg += e
-        else: mg -= m; eg -= e
-        if a in (2, 3): phase += 1; bishops[0 if v > 0 else 1] += (a == 3)
-        elif a == 4: phase += 2
-        elif a == 5: phase += 4
-    if bishops[0] >= 2: mg += 25; eg += 25
-    if bishops[1] >= 2: mg -= 25; eg -= 25
-    if phase > 24: phase = 24
-    return (mg * phase + eg * (24 - phase)) // 24
-
-nodes = 0; abort = False; TT = {}; killers = {}; history = {}; HIST = set()
-
-def order_moves(p, moves, tt_move, ply):
-    b = p.b; scored = []
-    k = killers.get(ply, ())
-    for m in moves:
-        sc = 0
-        if m == tt_move: sc = 1 << 24
-        else:
-            cap = b[m[1]]
-            if cap or m[1] == p.ep: sc = (1 << 20) + abs(cap if cap else 1) * 16 - abs(b[m[0]]) // 32
-            elif m in k: sc = 1 << 18
-            else: sc = history.get((p.side, m[0], m[1]), 0)
-            if m[2]: sc += 1 << 19
-        scored.append((sc, m))
-    scored.sort(key=lambda x: -x[0])
-    return [m for _, m in scored]
-
-def qsearch(p, alpha, beta, ply):
-    global nodes, abort
-    nodes += 1
-    if nodes >= CAP: abort = True
-    if abort: return alpha
-    if p.half >= 100: return 0
-    if ply > 28: return p.side * evaluate(p)
-    ksq = p.k[0] if p.side > 0 else p.k[1]
-    chk = attacked(p, ksq, -p.side)
-    if chk:
-        moves = gen_moves(p)
-    else:
-        stand = p.side * evaluate(p)
-        if stand >= beta: return beta
-        if stand > alpha: alpha = stand
-        moves = gen_moves(p, caps_only=True)
-    tt = TT.get(p.h)
-    moves = order_moves(p, moves, tt[3] if tt else None, ply)
-    legal = 0
-    for m in moves:
-        if not chk and not m[2]:
-            capv = p.b[m[1]]
-            if (capv or m[1] == p.ep) and stand + VAL[abs(capv) if capv else 1] + 150 <= alpha: continue
-        undo = make(p, m); undo.append(p.h)
-        if attacked(p, p.k[1] if p.side > 0 else p.k[0], p.side):
-            unmake(p, m, undo); continue
-        legal += 1
-        sc = -qsearch(p, -beta, -alpha, ply + 1)
-        unmake(p, m, undo)
-        if abort: return alpha
-        if sc >= beta: return beta
-        if sc > alpha: alpha = sc
-    if chk and not legal: return -MATE + ply
-    return alpha
-
-def search(p, depth, alpha, beta, ply):
-    global nodes, abort
-    if depth <= 0: return qsearch(p, alpha, beta, ply)
-    nodes += 1
-    if nodes >= CAP: abort = True
-    if abort: return alpha
-    if ply > 0:
-        if p.h in HIST or p.half >= 100: return 0
-        tt = TT.get(p.h)
-        if tt and tt[0] >= depth:
-            if tt[2] == 0: return tt[1]
-            if tt[2] == 1 and tt[1] < beta: beta = tt[1]
-            elif tt[2] == 2 and tt[1] > alpha: alpha = tt[1]
-            if alpha >= beta: return tt[1]
-    else:
-        tt = TT.get(p.h)
-    ksq = p.k[0] if p.side > 0 else p.k[1]
-    chk = attacked(p, ksq, -p.side)
-    if chk: depth += 1
-    moves = order_moves(p, gen_moves(p), tt[3] if tt else None, ply)
-    best = -2 * MATE; bestm = None; a0 = alpha
-    for m in moves:
-        undo = make(p, m); undo.append(p.h)
-        if attacked(p, p.k[1] if p.side > 0 else p.k[0], p.side):
-            unmake(p, m, undo); continue
-        sc = -search(p, depth - 1, -beta, -alpha, ply + 1)
-        unmake(p, m, undo)
-        if abort: return alpha
-        if sc > best: best = sc; bestm = m
-        if sc > alpha: alpha = sc
-        if alpha >= beta:
-            if not p.b[m[1]] and m[1] != p.ep:
-                kl = killers.setdefault(ply, [])
-                if m not in kl: kl.insert(0, m); del kl[2:]
-                history[(p.side, m[0], m[1])] = history.get((p.side, m[0], m[1]), 0) + depth * depth
-            break
-    if bestm is None:
-        return -MATE + ply if chk else 0
-    flag = 0 if a0 < best < beta else (1 if best <= a0 else 2)
-    TT[p.h] = (depth, best, flag, bestm)
-    return best
-
-def uci(m):
-    s, t, pr = m
-    out = 'abcdefgh'[s & 7] + str((s >> 4) + 1) + 'abcdefgh'[t & 7] + str((t >> 4) + 1)
-    if pr: out += 'nbrq'[abs(pr) - 2]
-    return out
-
-def parse_uci(p, u):
-    s = (int(u[1]) - 1) * 16 + (ord(u[0]) - 97)
-    t = (int(u[3]) - 1) * 16 + (ord(u[2]) - 97)
-    pr = 0
-    if len(u) > 4: pr = (2 + 'nbrq'.index(u[4])) * p.side
-    return (s, t, pr)
-
-def choose_moves(fen, hist_fens_moves):
-    """Return root moves ordered best-first for the position in fen."""
-    global nodes, abort, TT, killers, history, HIST
-    p = parse_fen(fen)
-    # rebuild game-history hashes for repetition awareness
-    HIST = set()
-    if hist_fens_moves:
-        start_fen, moves_uci = hist_fens_moves
-        q = parse_fen(start_fen); HIST.add(q.h)
-        for u in moves_uci:
-            make(q, parse_uci(q, u)); HIST.add(q.h)
-    TT = {}; killers = {}; history = {}
-    root = gen_moves(p)
-    scored = [(0, m) for m in root]
-    nodes = 0; abort = False
-    depth = 1
-    while depth <= 32:
-        cur = []
-        alpha = -2 * MATE
-        for _, m in scored:
-            undo = make(p, m); undo.append(p.h)
-            if attacked(p, p.k[1] if p.side > 0 else p.k[0], p.side):
-                unmake(p, m, undo); continue
-            sc = -search(p, depth - 1, -2 * MATE, -alpha if cur else 2 * MATE, 1)
-            unmake(p, m, undo)
-            if abort: break
-            cur.append((sc, m))
-            if sc > alpha: alpha = sc
-        if abort or not cur: break
-        cur.sort(key=lambda x: -x[0])
-        scored = cur; depth += 1
-    return [uci(m) for _, m in scored]
-
-# ---------- env driver
-ENV = os.environ.get('MAKEFUN_ENV_URL', '')
-
-def post(path, body):
-    req = Request(ENV + path, data=json.dumps(body).encode(), headers={'content-type': 'application/json'})
-    with urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode())
-
-def main():
-    st = post('/game', {})
-    while st.get('status') != 'done':
-        if st.get('status') == 'over':
-            st = post('/game', {}); continue
-        fen = st['fen']; legal = st.get('legal_moves') or []
-        cands = choose_moves(fen, (st.get('start_fen', fen), st.get('moves') or []))
-        tried = []
-        nxt = None
-        for mv in cands + [x for x in legal if x not in cands]:
-            if mv in tried: continue
-            tried.append(mv)
-            try:
-                nxt = post('/move', {'game': st['game'], 'move': mv}); break
-            except HTTPError:
-                continue
-        if nxt is None:
-            post('/resign', {'game': st['game']})
-            st = post('/game', {})
-        else:
-            st = nxt
-    sys.stdout.write(json.dumps({k: st.get(k) for k in ('wins', 'draws', 'losses')}) + '\n')
-
-if __name__ == '__main__':
-    main()
+#coding:l1
+import lzma;exec(lzma.decompress('\x000\0\0×.\0\0\0\0\0\0\x004œ%Å¯^´ÍôMÏ8õ;õœ˜¹p¹˜­Át849\n‡L<•µVóÑ&b­6M¯—ià\\-¿„·Vë”Zº\'WsÎ»P•…ùÓé6yÿ»_¤Ï±,Ü\'‚ÔkÀ·ØúŒê“óÇüÌ QU¼=q(‚}[<LŒ¾´	\nŒÁ*éÄÓÈĞÔóÏƒÙçÕ3eVV_À…šR$©èz9­gl ÖšâH‹·ZãˆÏş™K0\'òEP@ØŸÁÈòÒ½¬gÚıÚ­¦¶rĞ„è·ä°Ø“\\…ËAV3Ô%ÌÖÔ*åP¯°¼j’|…ò¯[˜ÒBÃÚğÔO—€mp‰?eÏ¸Té@˜*:½ä‹æJş% %RõÄyC©M¼İ“şdµ;ÀŸŞpÍ6¬«•PÅùm_k[å¡m8ø?rü—Î†îiQøÀmÈŠ~Ô¯ä-KÁkØ9\'0E•÷Q]‹ë~ˆ¨jBÇ‚åã¹‘Dé¢2»¹¡×AMj‹Ìô¥{`ZºV\ru6¼Vl¾‹°7“µâÀ·WEå\\ıUS¾¦í¶ö{–:ÊvfÒŒ¡6XQpUâ‚\\ÓÃãáQCo(àş&J8†{Ï{;`¥™´{4%ö¬¶{\0.|Nì˜T7³ºX£NÿÂ¼kBø(3ìäDXÓ‚”Õ§ä\\ênOŒ¨ğ8C³7Ø%ı¾cFˆÚ>jem×Œ^Ev›•@ÓRÛÚï‹˜µYí„£¢›Yáôš4VÓQ¶\r oûİ¢a—°¤5Ã*\0GÒ˜)]÷WÇ#¸Q2ò[h¨:ËR=8¦XèƒGvªI7i’¾šäzÜ((§VÕ‚¶$/çº^7L©WüÆo°1xûã5\nœ†¾G²2·2=Ä#„»ì\nıĞ¹pfÌ-×Ÿp4#‚ŞŞ<Ò Z¢¤Ü•6Y–…¦¤“8üÙü.Qñ.åa¯ØJósğMH¶?2\\ïÇE®ëBubŞÅÿ¼{Ï„¾ç´^¤zíøK2$¨M«ğ½îu¡¸íñˆ³7´µzOÖi‘ËF¦“PÆxMÕœ´M„­0\\{ÌL\r17If ğyŞn?zÿUT ë{f¿ı6†y*TF{EBó\\,T Œ•¦wZ%kù@„HòÇ÷ï¦İ$Æ½fºæÚ5&ïü“p4-¢İÛ!¿xšÃZV½% «WˆJˆvà=\rbÚæçOŠ!ÏS÷W›Õ_hì·	0µ8h`ähv‘RUÛAÆY]¬°}ÎI–!$ôg¤*VXÅÄ£%\'€¤QÑ¨;|_8 ÿ<gûk Û	—ıÒ‚›ø“áN<”F†\nr	×®\'~÷zÌl™•³ÿ‘˜ÀÀú\rŸ‹H~3‹¿L‚0\\HK­\r«\\ó÷Ï@RZüp®µU6Ÿ”¦ø€ø¢Öa\nÅÆc¨\n¥f„ş4O"¨Ö±äÂØÉğ|i¤ÈØMŞ¸m45,y¿	ğ¥`?;LO†2Î½a’dl”QĞm%º‡ÍÃ.Rõ_7îÌeîvùŠ–JN@Ë×-ú/¿’Óc%÷åíÔÇqa„ˆî3 ¦;&d;—èïÄ\rÛÅÖÁŠ?aTçMÕ1È·QzŸ˜!ãyQ‰•´šËâ;>XŒ#û‚R´÷JôN—ä½(åE%5iW·Ê²ğoú¥MÿÖÚ{%UøJ~T$\n‘•EOêèÄ4´ÂÆæE:ï)P|É˜&º8¦\nÊÚÙ¨şF`ÑÔxXÅVA¬È¹\\jò}aHĞ’&ÄK¯Ê\\µçP¨`OS“óú¢eC‘æÜ)#øUç=œ±M_üZ¤G:pÄ\rB«¼ïu¥gR€_ş÷ª"F|¡…»J¿?¥­€`šïmh£ødØ0Ğ°$Š³à÷v°·"|Ñyå­Jk5Şı›xWlÂ^(èĞ™W‘Òyh¦†ˆ9J«ú÷ğÿZ™\\îÑêP\rĞ_šgmq! X0­9C£ûı]\'¨ÀW¬-£»º³ô’æá#/ê`\0æU©H…œÆtaX‚´Ë,Öüñ`¹ıaáI\0…·AÍM|åh…ºçXThÒÑ¼_é\0·]–E lÚÍšÃ\\<ÙÄÉê-	Ê–¹¨^ô¬QJ„B)E«(Ú®·ô¹ğŒmˆµ€;BÂa\nVı±ñ\0©¼†PLíÍy„	oÕÉƒ2©Ix¸%‡Ü}a$ëÚ\'£Ï)I¹`SÁõ&×ÇHf¶/I›öÁbU‚êB¾ÓÌSIVÀ~« AdBı?nA-\nù-5B$§ñªúşo*_ÎyäeÆO±PÕ\0bÃDGmÔ‹^*@w¤-XÈáŸ^I¹¦F6KÍVËu7±d‘K…š»î˜"¨HK/J›kO!Ïf€}öV¼Ï•;)gª™~ÄÔ„©şõm!Täº¬ôÚã”\rÒ*»cfÙÏwİÏ„ªú8©XÌÈe—!—­q®q¢÷m£jÙˆÔ?}‘ˆÏv”°çìtoY+ …lœfÿî»¤¦Iı€—éa?\nwÍ¡Ëµ#x(\r¶ù†©|¾¾D»âkë	qèÎw›¥ªƒ>×yF˜ˆú™ˆ’R‘Î¦gÒcxaîŸ3R=”İPa)ßA†owíƒT}bgf%3ƒ\0/À„ì¢RM0Ïélµ7Ê€„v¤æ2½±yŒ\r ^èm¿:^s û¤ÇÖ’±v~# ˆ-\0ë|¶OJ5»\n´¬#1Õš¥%Õ]‘PëÏjq8rŞÇ7ŠS Ãigb8†Uûû4ÿÉP“u;oĞÀ-¨oŒh9\n”`7ür®_SˆµFÁ,‡9èßæ¨¤	KBQCí¹ª,¦/:]>mĞd»¿çòHKÂ5òñ¯ƒÊ ;f3”€ K?Òf±µŞŒ@ô2íñ\nD5ÒRØâK“×¾ÿÇ?½[ÔŸşÑw÷~«ÄÕ6îKÈ‡¥;nİ:±äGøÂ¡,Qzäe3¹=Zòœƒ´ùZZÖ]È-Åé’Î&ŸôL_Í)Ÿ#kMÜùXÙ_ÏÎMctWò½~‚æ@®ñ¬­3‰œ¹8? ¨sƒˆ‘p0x„ErX§´—Ê÷ŒÆN&ÃÎƒhÏõâçŞ»ÚwQşHÃ^S{#]äı“ÔAM9)V+2‹T·´:ß0Ænmá€ò¾vÚ±ô„hÛí`IŒ7_ˆi°4!£I­Å^î5—Œì¾LDVü±h¦-tzI­L¡^n$Ş*£8r7TÃ jv¨áQ_NØˆ¯õ÷¥Nütw¢AÔoa<mfl4cF4é´ŒY65ÁPú~LsşCÂõcòÏ¤H1>xJ	¦Q…Ã©åÈ–f£\n9y^ZGà¶ÅÓB+xê*ùØÄÉá/0P„3 7k´çw*í$Ù„$WjçâË ¶­¾Î…[ê²³¥_ª\0¶Ã¾»ğ¡¿ı‡&C×^0u%¼AêËE\0s·7BŞ«¡ÀWSÇz¶ÇwG1şı@MÃj%1„°Ùwx|œ½Â~Œ3ùµÃ¤æ[İÚ‰qrU>RUå”„+úğ?¾IƒT÷©wÏj—ÚDîe^ë¼ÅY+¶àı42ì˜Åê–â Äı„É­\r1=Õ¿±v¡˜AèóêDÅğ¸ü\n |¢tz1òZƒ3ë¡QE¶0¼Uv7—ÉÕ…Ş·E55rıR¾p&‡\'šoh»;ãO²zÜtÁ^¼™öP’~mÈ•†_Ô—­K¬Hä0ÖÉc{£g4*ÀRå„Ûè|†6k\r­W‹´4póä`.+œÇ#ô‰Ì¬í&û}¡%»èüØ5§"Q4×D®¼«é‰’n¶º®ÀÚ˜ÎÛ«l\\öı¦Q&l¦mgnäoµ¡ÜWDËÿîXJ>^B¼ƒxğ¤<N¢vZRÀpïêÓ,.Åÿµ‚83oÒ˜ÌúaÈ!öÓ:)Ö’Ô‚CSÏkŸ¢) ‰Çc‡“±.Hs|®Z´“»:9_A,ÎwWÙ€²Hî­cÊ8Ÿ\0Üé*÷¿ ³ÚwØ5®Š`\r™©i­šÌé\nÂm2KU·Æ–ŞÙaìt¿*íM=xØ¦Q}¼PnÍ)kaG¥U!t£l¹°³˜çîëáJeZ’°÷B…….®	_øÓÜ_Õ\\½j—+ÃbeÁq|Û«^ç¡$s¦\'V/(›UaP¦”±,Ü›Úè”à«~–ŒöMõQ+ˆù•ªVÔm\'†õõ0&EÎÄƒÁ‚sYSĞR”y·Ä“üR½æ{Iø‚çÖ‘øBkä)ƒÏ†çÂtÉæ´™½r§øp_*İÛ›ÖŒ©K9ïÑ¹\'S.&¡êĞm$¤dïzÅùí‚FâNNŞk¥oˆèrÔN;*-Fšş5\0€³88Ô\\z‹èHóåG¹liœK‹+Ä™”{JêlôlO¹`«#\nÛŞ";T¹ë?Gßkk,Ò¼OFÉBp]dJ2Ë©æTîzøzÉÁá+&’xgX÷?û¦üĞúøšRPRebğ·ærŒğ;ï{Ï¥Eº6ÄÔ†ÂCÌ(|mì§"šÃËÆ¯ò‡P¸SWòrøÆdÓ`-F©|®ˆ©æ\\~çş¶äG?R§¥×µ™o eK‚­Ã¾İDX³9</»I\0í»\'gæ ¯&@…TP¢«Æiª¹·¶äÈ5¢÷o«.³?íÑ€´Ñ¡N3³æŒÌµk7z m)0èëßø\0ç9«°#•Ø¿È*ˆf½ÚøÖä9Âã Eâäk\\ò#Ÿ)füéÖ‡8·’®èå(HâmCt«ûÒY¥e)®å©1Bµñä58Ñhä]ÃÿÆ°=8ã¬XÑùn2sÎÉ!/Oèg£A¦¬=bQtÆ¶Ü79aRš*LÆêïB‹\\á¥“°Ïşö¹œe×f¾>×h!{]Ÿ­:huúNPÊî¬b–ÄÃ£Óƒrn/äËñÃŸïµ~|**“äZ6šæ^K+ƒºÎÌPµ}üÕÏûßàWğR†¤ÈÚEİ¶!4°×÷/ÿê"#±¶”òjlÙÜ(\0'.encode('l1')))
