@@ -1,0 +1,3 @@
+__pycache__/
+dev/trial-*-run/
+dev/bundle*.tar.gz
